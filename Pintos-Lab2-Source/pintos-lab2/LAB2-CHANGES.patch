@@ -1,0 +1,671 @@
+--- a/src/Make.config
++++ b/src/Make.config
+@@ -61,3 +61,7 @@
+ QEMU = qemu-system-i386
+ CFLAGS += -fno-pie -fno-stack-protector
+ LDFLAGS += -no-pie
++# Pintos and its original tests use legacy common-symbol declarations.
++CFLAGS += -fcommon
++# Keep headers/text in one LOAD segment for the original Pintos ELF loader.
++LDFLAGS += -Wl,-z,noseparate-code
+--- a/src/filesys/filesys.h
++++ b/src/filesys/filesys.h
+@@ -9,7 +9,7 @@
+ #define ROOT_DIR_SECTOR 1       /* Root directory file inode sector. */
+ 
+ /* Block device that contains the file system. */
+-struct block *fs_device;
++extern struct block *fs_device;
+ 
+ void filesys_init (bool format);
+ void filesys_done (void);
+--- a/src/threads/thread.c
++++ b/src/threads/thread.c
+@@ -705,6 +705,12 @@
+   t->waiting_lock = NULL;
+   list_init (&t->locks_held);
+ 
++  #ifdef USERPROG
++  list_init (&t->children);
++  list_init (&t->open_files);
++  t->next_fd = 2;
++  t->exit_status = -1;
++#endif
+   t->magic = THREAD_MAGIC;
+ 
+   old_level = intr_disable ();
+--- a/src/threads/thread.h
++++ b/src/threads/thread.h
+@@ -108,6 +108,14 @@
+ #ifdef USERPROG
+     /* Owned by userprog/process.c. */
+     uint32_t *pagedir;                  /* Page directory. */
++    struct list children;              /* Owned child-status records. */
++    struct child_status *child_status;  /* This process's shared status. */
++    struct list open_files;             /* Per-process file descriptors. */
++    int next_fd;                       /* Next descriptor, starting at 2. */
++    int exit_status;                   /* -1 unless explicitly exited. */
++    bool is_user_process;              /* Enables termination message. */
++    char *program_name;                /* Full executable name. */
++    struct file *executable;           /* Deny writes until termination. */
+ #endif
+ 
+     /* Owned by thread.c. */
+--- a/src/userprog/pagedir.c
++++ b/src/userprog/pagedir.c
+@@ -261,3 +261,11 @@
+       pagedir_activate (pd);
+     } 
+ }
++
++/* Check both presence and permission before copying into user memory. */
++bool
++pagedir_is_writable (uint32_t *pd, const void *upage)
++{
++  uint32_t *pte = lookup_page (pd, upage, false);
++  return pte != NULL && (*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W);
++}
+--- a/src/userprog/pagedir.h
++++ b/src/userprog/pagedir.h
+@@ -8,6 +8,7 @@
+ void pagedir_destroy (uint32_t *pd);
+ bool pagedir_set_page (uint32_t *pd, void *upage, void *kpage, bool rw);
+ void *pagedir_get_page (uint32_t *pd, const void *upage);
++bool pagedir_is_writable (uint32_t *pd, const void *upage);
+ void pagedir_clear_page (uint32_t *pd, void *upage);
+ bool pagedir_is_dirty (uint32_t *pd, const void *upage);
+ void pagedir_set_dirty (uint32_t *pd, const void *upage, bool dirty);
+--- a/src/userprog/process.c
++++ b/src/userprog/process.c
+@@ -8,6 +8,8 @@
+ #include "userprog/gdt.h"
+ #include "userprog/pagedir.h"
+ #include "userprog/tss.h"
++#include "userprog/syscall.h"
++#include "threads/malloc.h"
+ #include "filesys/directory.h"
+ #include "filesys/file.h"
+ #include "filesys/filesys.h"
+@@ -21,73 +23,188 @@
+ static thread_func start_process NO_RETURN;
+ static bool load (const char *cmdline, void (**eip) (void), void **esp);
+ 
+-/* Starts a new thread running a user program loaded from
+-   FILENAME.  The new thread may be scheduled (and may even exit)
+-   before process_execute() returns.  Returns the new process's
+-   thread id, or TID_ERROR if the thread cannot be created. */
++/* Heap startup packet avoids a parent-stack lifetime dependency. */
++struct start_info
++  {
++    char *command;
++    struct child_status *status;
++  };
++
++static void
++status_release (struct child_status *status)
++{
++  enum intr_level old = intr_disable ();
++  bool last = --status->references == 0;
++  intr_set_level (old);
++  if (last)
++    free (status);
++}
++
++/* Copy the kernel command before the child can run. */
+ tid_t
+-process_execute (const char *file_name) 
++process_execute (const char *command)
+ {
+-  char *fn_copy;
++  struct thread *parent = thread_current ();
++  struct start_info *info;
++  struct child_status *status;
++  char *copy;
++  char name[16];
++  size_t n = 0;
+   tid_t tid;
+ 
+-  /* Make a copy of FILE_NAME.
+-     Otherwise there's a race between the caller and load(). */
+-  fn_copy = palloc_get_page (0);
+-  if (fn_copy == NULL)
++  if (command == NULL || strlen (command) >= PGSIZE)
+     return TID_ERROR;
+-  strlcpy (fn_copy, file_name, PGSIZE);
+-
+-  /* Create a new thread to execute FILE_NAME. */
+-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
++  while (*command == ' ')
++    command++;
++  if (*command == 0)
++    return TID_ERROR;
++  while (command[n] && command[n] != ' ' && n < sizeof name - 1)
++    { name[n] = command[n]; n++; }
++  name[n] = 0;
++  copy = palloc_get_page (0);
++  info = malloc (sizeof *info);
++  status = malloc (sizeof *status);
++  if (copy == NULL || info == NULL || status == NULL)
++    {
++      if (copy != NULL) palloc_free_page (copy);
++      free (info);
++      free (status);
++      return TID_ERROR;
++    }
++  strlcpy (copy, command, PGSIZE);
++  status->exit_status = -1;
++  status->load_ok = false;
++  status->references = 2;
++  sema_init (&status->loaded, 0);
++  sema_init (&status->exited, 0);
++  info->command = copy;
++  info->status = status;
++  tid = thread_create (name, PRI_DEFAULT, start_process, info);
+   if (tid == TID_ERROR)
+-    palloc_free_page (fn_copy); 
++    {
++      palloc_free_page (copy);
++      free (info);
++      free (status);
++      return TID_ERROR;
++    }
++  status->tid = tid;
++  list_push_back (&parent->children, &status->elem);
++  sema_down (&status->loaded);
++  if (!status->load_ok)
++    {
++      list_remove (&status->elem);
++      status_release (status);
++      return TID_ERROR;
++    }
+   return tid;
+ }
+ 
+-/* A thread function that loads a user process and starts it
+-   running. */
++/* Build the ABI stack after checking the complete required size. */
++static bool
++push_arguments (void **esp, char **argv, int argc)
++{
++  size_t bytes = 0;
++  size_t padding;
++  int i;
++  uint8_t *sp = *esp;
++  for (i = 0; i < argc; i++)
++    bytes += strlen (argv[i]) + 1;
++  padding = (4 - bytes % 4) % 4;
++  if (bytes + padding + (argc + 4) * sizeof (uint32_t) > PGSIZE)
++    return false;
++  for (i = argc - 1; i >= 0; i--)
++    {
++      size_t len = strlen (argv[i]) + 1;
++      sp -= len;
++      memcpy (sp, argv[i], len);
++      argv[i] = (char *) sp;
++    }
++  sp -= padding;
++  memset (sp, 0, padding);
++  sp -= 4;
++  *(uint32_t *) sp = 0;
++  for (i = argc - 1; i >= 0; i--)
++    { sp -= 4; *(char **) sp = argv[i]; }
++  {
++    char **user_argv = (char **) sp;
++    sp -= 4; *(char ***) sp = user_argv;
++    sp -= 4; *(int *) sp = argc;
++    sp -= 4; *(uint32_t *) sp = 0;
++  }
++  *esp = sp;
++  return true;
++}
++
+ static void
+-start_process (void *file_name_)
++start_process (void *aux)
+ {
+-  char *file_name = file_name_;
++  struct start_info *info = aux;
++  struct thread *cur = thread_current ();
++  struct child_status *status = info->status;
++  char *command = info->command;
++  char **argv = palloc_get_page (0);
++  char *token, *save;
++  int argc = 0;
++  bool success = false;
+   struct intr_frame if_;
+-  bool success;
+-
+-  /* Initialize interrupt frame and load executable. */
++  cur->child_status = status;
++  cur->is_user_process = true;
++  free (info);
+   memset (&if_, 0, sizeof if_);
+   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+   if_.cs = SEL_UCSEG;
+   if_.eflags = FLAG_IF | FLAG_MBS;
+-  success = load (file_name, &if_.eip, &if_.esp);
+-
+-  /* If load failed, quit. */
+-  palloc_free_page (file_name);
+-  if (!success) 
++  if (argv != NULL)
++    {
++      for (token = strtok_r (command, " ", &save); token != NULL;
++           token = strtok_r (NULL, " ", &save))
++        {
++          if (argc == PGSIZE / sizeof *argv)
++            goto done;
++          argv[argc++] = token;
++        }
++      if (argc > 0)
++        {
++          cur->program_name = malloc (strlen (argv[0]) + 1);
++          if (cur->program_name == NULL)
++            goto done;
++          strlcpy (cur->program_name, argv[0], strlen (argv[0]) + 1);
++          lock_acquire (&filesys_lock);
++          success = load (argv[0], &if_.eip, &if_.esp);
++          lock_release (&filesys_lock);
++          if (success)
++            success = push_arguments (&if_.esp, argv, argc);
++        }
++    }
++ done:
++  if (argv != NULL) palloc_free_page (argv);
++  palloc_free_page (command);
++  status->load_ok = success;
++  sema_up (&status->loaded);
++  if (!success)
+     thread_exit ();
+-
+-  /* Start the user process by simulating a return from an
+-     interrupt, implemented by intr_exit (in
+-     threads/intr-stubs.S).  Because intr_exit takes all of its
+-     arguments on the stack in the form of a `struct intr_frame',
+-     we just point the stack pointer (%esp) to our stack frame
+-     and jump to it. */
+   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+   NOT_REACHED ();
+ }
+ 
+-/* Waits for thread TID to die and returns its exit status.  If
+-   it was terminated by the kernel (i.e. killed due to an
+-   exception), returns -1.  If TID is invalid or if it was not a
+-   child of the calling process, or if process_wait() has already
+-   been successfully called for the given TID, returns -1
+-   immediately, without waiting.
+-
+-   This function will be implemented in problem 2-2.  For now, it
+-   does nothing. */
+ int
+-process_wait (tid_t child_tid UNUSED) 
++process_wait (tid_t child_tid)
+ {
++  struct list *children = &thread_current ()->children;
++  struct list_elem *e;
++  for (e = list_begin (children); e != list_end (children); e = list_next (e))
++    {
++      struct child_status *status = list_entry (e, struct child_status, elem);
++      if (status->tid == child_tid)
++        {
++          int result;
++          list_remove (e); /* A second wait cannot find this record. */
++          sema_down (&status->exited);
++          result = status->exit_status;
++          status_release (status);
++          return result;
++        }
++    }
+   return -1;
+ }
+ 
+@@ -98,6 +215,23 @@
+   struct thread *cur = thread_current ();
+   uint32_t *pd;
+ 
++  if (cur->is_user_process)
++    printf ("%s: exit(%d)\n", cur->program_name != NULL
++            ? cur->program_name : cur->name, cur->exit_status);
++  syscall_close_all ();
++  lock_acquire (&filesys_lock);
++  file_close (cur->executable);
++  cur->executable = NULL;
++  lock_release (&filesys_lock);
++  free (cur->program_name);
++  cur->program_name = NULL;
++  while (!list_empty (&cur->children))
++    {
++      struct child_status *status = list_entry (list_pop_front (&cur->children),
++                                                struct child_status, elem);
++      status_release (status);
++    }
++
+   /* Destroy the current process's page directory and switch back
+      to the kernel-only page directory. */
+   pd = cur->pagedir;
+@@ -114,6 +248,14 @@
+       pagedir_activate (NULL);
+       pagedir_destroy (pd);
+     }
++  if (cur->child_status != NULL)
++    {
++      struct child_status *status = cur->child_status;
++      status->exit_status = cur->exit_status;
++      sema_up (&status->exited);
++      cur->child_status = NULL;
++      status_release (status);
++    }
+ }
+ 
+ /* Sets up the CPU for running user code in the current
+@@ -229,6 +371,8 @@
+       goto done; 
+     }
+ 
++  file_deny_write (file);
++
+   /* Read and verify executable header. */
+   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
+       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
+@@ -312,7 +456,10 @@
+ 
+  done:
+   /* We arrive here whether the load is successful or not. */
+-  file_close (file);
++  if (success)
++    t->executable = file;
++  else
++    file_close (file);
+   return success;
+ }
+ 
+--- a/src/userprog/process.h
++++ b/src/userprog/process.h
+@@ -2,6 +2,19 @@
+ #define USERPROG_PROCESS_H
+ 
+ #include "threads/thread.h"
++#include "threads/synch.h"
++
++/* Two references: parent ownership and child ownership. */
++struct child_status
++  {
++    tid_t tid;
++    int exit_status;
++    bool load_ok;
++    int references;
++    struct semaphore loaded;
++    struct semaphore exited;
++    struct list_elem elem;
++  };
+ 
+ tid_t process_execute (const char *file_name);
+ int process_wait (tid_t);
+--- a/src/userprog/syscall.c
++++ b/src/userprog/syscall.c
+@@ -1,20 +1,248 @@
+ #include "userprog/syscall.h"
+ #include <stdio.h>
++#include <string.h>
+ #include <syscall-nr.h>
++#include "devices/input.h"
++#include "devices/shutdown.h"
++#include "filesys/file.h"
++#include "filesys/filesys.h"
+ #include "threads/interrupt.h"
++#include "threads/malloc.h"
++#include "threads/palloc.h"
+ #include "threads/thread.h"
++#include "threads/vaddr.h"
++#include "userprog/pagedir.h"
++#include "userprog/process.h"
++
++struct lock filesys_lock;
++
++struct file_descriptor
++  {
++    int number;
++    struct file *file;
++    struct list_elem elem;
++  };
+ 
+ static void syscall_handler (struct intr_frame *);
+ 
++static void
++bad_user (void)
++{
++  thread_current ()->exit_status = -1;
++  thread_exit ();
++}
++
++/* One inspection per intersected page, with overflow-safe bounds.
++   No eviction or shared user threads exist in Project 2, so a validated
++   mapping cannot disappear while this syscall is executing. */
++static void
++validate_buffer (const void *buffer, unsigned size, bool writable)
++{
++  uintptr_t first = (uintptr_t) buffer;
++  uintptr_t last, page;
++  uint32_t *pd = thread_current ()->pagedir;
++  if (size == 0)
++    return;
++  if (first == 0 || first >= (uintptr_t) PHYS_BASE
++      || size > (uintptr_t) PHYS_BASE - first)
++    bad_user ();
++  last = first + size - 1;
++  for (page = (uintptr_t) pg_round_down (buffer); page <= last; page += PGSIZE)
++    if (writable ? !pagedir_is_writable (pd, (void *) page)
++                 : pagedir_get_page (pd, (void *) page) == NULL)
++      bad_user ();
++}
++
++/* First locate the terminator, then allocate: bad pointers leak nothing.
++   Each page is checked once. Commands/paths are limited to one page. */
++static char *
++copy_string (const char *user)
++{
++  size_t n;
++  uintptr_t address = (uintptr_t) user;
++  for (n = 0; n < PGSIZE; n++)
++    {
++      uintptr_t at = address + n;
++      if (at < address || at >= (uintptr_t) PHYS_BASE || at == 0)
++        bad_user ();
++      if (n == 0 || pg_ofs ((void *) at) == 0)
++        validate_buffer ((void *) at, 1, false);
++      if (*(const char *) at == 0)
++        {
++          char *copy = malloc (n + 1);
++          if (copy != NULL) memcpy (copy, user, n + 1);
++          return copy;
++        }
++    }
++  return NULL;
++}
++
++static struct file_descriptor *
++find_fd (int number)
++{
++  struct list *files = &thread_current ()->open_files;
++  struct list_elem *e;
++  for (e = list_begin (files); e != list_end (files); e = list_next (e))
++    {
++      struct file_descriptor *fd = list_entry (e, struct file_descriptor, elem);
++      if (fd->number == number) return fd;
++    }
++  return NULL;
++}
++
++static void
++close_fd (struct file_descriptor *fd)
++{
++  if (fd == NULL) return;
++  list_remove (&fd->elem);
++  lock_acquire (&filesys_lock);
++  file_close (fd->file);
++  lock_release (&filesys_lock);
++  free (fd);
++}
++
++void
++syscall_close_all (void)
++{
++  struct list *files = &thread_current ()->open_files;
++  while (!list_empty (files))
++    close_fd (list_entry (list_front (files), struct file_descriptor, elem));
++}
++
+ void
+-syscall_init (void) 
++syscall_init (void)
+ {
++  lock_init (&filesys_lock);
+   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+ }
+ 
+ static void
+-syscall_handler (struct intr_frame *f UNUSED) 
++syscall_handler (struct intr_frame *f)
+ {
+-  printf ("system call!\n");
+-  thread_exit ();
++  uint32_t call, args[3] = {0, 0, 0};
++  unsigned count;
++  struct file_descriptor *fd;
++  struct thread *cur = thread_current ();
++  validate_buffer (f->esp, sizeof call, false);
++  memcpy (&call, f->esp, sizeof call);
++  switch (call)
++    {
++    case SYS_HALT: count = 0; break;
++    case SYS_EXIT: case SYS_EXEC: case SYS_WAIT: case SYS_REMOVE:
++    case SYS_OPEN: case SYS_FILESIZE: case SYS_TELL: case SYS_CLOSE:
++      count = 1; break;
++    case SYS_CREATE: case SYS_SEEK: count = 2; break;
++    case SYS_READ: case SYS_WRITE: count = 3; break;
++    default: bad_user (); return;
++    }
++  if (count != 0)
++    {
++      const void *start = (const uint8_t *) f->esp + sizeof call;
++      validate_buffer (start, count * sizeof *args, false);
++      memcpy (args, start, count * sizeof *args);
++    }
++  f->eax = -1;
++  switch (call)
++    {
++    case SYS_HALT:
++      shutdown_power_off ();
++      break;
++    case SYS_EXIT:
++      cur->exit_status = (int) args[0];
++      thread_exit ();
++      break;
++    case SYS_WAIT:
++      f->eax = process_wait ((tid_t) args[0]);
++      break;
++    case SYS_EXEC:
++      {
++        char *command = copy_string ((const char *) args[0]);
++        if (command != NULL)
++          {
++            f->eax = process_execute (command);
++            free (command);
++          }
++        break;
++      }
++    case SYS_CREATE: case SYS_REMOVE: case SYS_OPEN:
++      {
++        char *name = copy_string ((const char *) args[0]);
++        if (call != SYS_OPEN) f->eax = false;
++        if (name == NULL) break;
++        if (call == SYS_OPEN)
++          {
++            fd = malloc (sizeof *fd);
++            if (fd != NULL && cur->next_fd < 0x7fffffff)
++              {
++                lock_acquire (&filesys_lock);
++                fd->file = filesys_open (name);
++                lock_release (&filesys_lock);
++                if (fd->file != NULL)
++                  {
++                    fd->number = cur->next_fd++;
++                    list_push_back (&cur->open_files, &fd->elem);
++                    f->eax = fd->number;
++                  }
++                else free (fd);
++              }
++            else free (fd);
++          }
++        else
++          {
++            lock_acquire (&filesys_lock);
++            f->eax = call == SYS_CREATE ? filesys_create (name, args[1])
++                                        : filesys_remove (name);
++            lock_release (&filesys_lock);
++          }
++        free (name);
++        break;
++      }
++    case SYS_READ: case SYS_WRITE:
++      {
++        void *buffer = (void *) args[1];
++        unsigned size = args[2];
++        validate_buffer (buffer, size, call == SYS_READ);
++        fd = find_fd ((int) args[0]);
++        if (call == SYS_READ && args[0] == 0)
++          {
++            unsigned i;
++            for (i = 0; i < size; i++) ((uint8_t *) buffer)[i] = input_getc ();
++            f->eax = size;
++          }
++        else if (call == SYS_WRITE && args[0] == 1)
++          {
++            unsigned offset = 0;
++            while (offset < size)
++              {
++                unsigned chunk = size - offset;
++                if (chunk > 512) chunk = 512;
++                putbuf ((const char *) buffer + offset, chunk);
++                offset += chunk;
++              }
++            f->eax = size;
++          }
++        else if (fd != NULL)
++          {
++            lock_acquire (&filesys_lock);
++            f->eax = call == SYS_READ ? file_read (fd->file, buffer, size)
++                                      : file_write (fd->file, buffer, size);
++            lock_release (&filesys_lock);
++          }
++        break;
++      }
++    case SYS_CLOSE:
++      close_fd (find_fd ((int) args[0]));
++      break;
++    case SYS_FILESIZE: case SYS_SEEK: case SYS_TELL:
++      fd = find_fd ((int) args[0]);
++      if (fd != NULL)
++        {
++          lock_acquire (&filesys_lock);
++          if (call == SYS_FILESIZE) f->eax = file_length (fd->file);
++          else if (call == SYS_TELL) f->eax = file_tell (fd->file);
++          else file_seek (fd->file, args[1]);
++          lock_release (&filesys_lock);
++        }
++      break;
++    }
+ }
+--- a/src/userprog/syscall.h
++++ b/src/userprog/syscall.h
+@@ -1,6 +1,7 @@
+ #ifndef USERPROG_SYSCALL_H
+ #define USERPROG_SYSCALL_H
+-
++#include "threads/synch.h"
++extern struct lock filesys_lock;
+ void syscall_init (void);
+-
+-#endif /* userprog/syscall.h */
++void syscall_close_all (void);
++#endif

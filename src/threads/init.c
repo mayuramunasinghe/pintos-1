@@ -134,8 +134,53 @@ pintos_init (void)
     run_actions (argv);
   } else {
     // TODO: no command line passed to kernel. Run interactively 
-  }
+    char command[100];
 
+    while(true){
+      int i=0;
+      char c;
+
+      printf("CS2042> ");
+
+      while(i<99){
+        c = input_getc();
+        printf("%c",c);
+
+        if(c == '\n'||c =='\r'){
+          break;
+        }
+        command[i++] = c;
+      }
+      command[i] = '\0';
+
+      printf("\n");
+
+      if(!strcmp(command, "exit")){
+        break;
+      }
+      else if(!strcmp(command, "whoami")){
+        printf("Mayura Munasinghe 240439T\n");
+      }
+      else if(!strcmp(command, "time")){
+        printf("Time: %lu\n", rtc_get_time());
+      }
+      else if(!strcmp(command, "ram")){
+        printf ("Pintos uses %'"PRIu32" kB RAM\n",init_ram_pages * PGSIZE / 1024);
+      }
+      else if(!strcmp(command, "thread")){
+        printf ("Current Thread: %s\n", thread_current()->name);
+      }
+      else if(!strcmp(command, "priority")){
+        printf ("Current Thread priority: %d\n", thread_current()->priority);
+      }
+      else if(!strcmp(command, "shutdown")){
+        shutdown_power_off();
+      }
+      else if (command[0] != '\0'){
+        printf ("Unknown command: %s\n", command);
+      }
+    }
+  }
   /* Finish up. */
   shutdown ();
   thread_exit ();
